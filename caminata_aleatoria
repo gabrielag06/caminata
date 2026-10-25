@@ -1,0 +1,459 @@
+"""
+Simulación de Caminata Aleatoria (Movimiento Browniano discreto)
+Ma2004b - Optimización Estocástica
+Gabriela García Velásquez A01770989
+
+Requisitos:  Python 3.8+  y  numpy 
+Ejecutar:  python caminata_aleatoria.py
+
+Modelo
+  * La partícula inicia en el origen. En cada paso se elige uniformemente al azar
+    un eje (de los d disponibles) y un sentido (+1/-1). El paso mide 1.
+  * Distancia = norma euclidiana desde el origen: sqrt(x1^2 +.. + xd^2).
+    (Para d = 1 es el valor absoluto.)
+  * Por cada caminata se guarda la distancia MÁXIMA alcanzada durante la caminata.
+"""
+
+import csv
+import math
+import os
+import queue
+import threading
+import time
+import tkinter as tk
+from tkinter import ttk, messagebox
+import tkinter.font as tkfont
+import numpy as np
+
+
+ 
+#  LÓGICA DE LA SIMULACIÓN
+ 
+class CaminataAleatoria:
+    """Simula caminatas aleatorias de pasos unitarios en R^d."""
+
+    def __init__(self, semilla=None):
+        self.rng = np.random.default_rng(semilla)
+
+    def distancias_maximas(self, dimension, pasos, repeticiones, progreso=None):
+        """
+        Realiza "repeticiones caminatas" de "pasos" pasos en "dimension" dimensiones.
+
+        Devuelve (distancias, segundos):
+          distancias: arreglo con la distancia máxima al origen de cada caminata.
+          segundos: tiempo de ejecución de todas las caminatas.
+        `progreso` es una función opcional que recibe un valor entre 0 y 1.
+        """
+        d, n = dimension, pasos
+        # Se procesan varias caminatas a la vez (en bloques) para ser rápido
+        # sin gastar demasiada memoria.
+        bloque = max(1, min(repeticiones, 2_000_000 // n))
+        resultado = np.empty(repeticiones)
+        hechas = 0
+
+        t0 = time.perf_counter()
+        while hechas < repeticiones:
+            m = min(bloque, repeticiones - hechas)
+            ejes = self.rng.integers(0, d, size=(m, n))  # eje elegido en cada paso
+            signos = (self.rng.integers(0, 2, size=(m, n)) * 2 - 1).astype(np.int32)  # +1 / -1
+
+            dist2 = np.zeros((m, n))  # distancia^2 en cada paso
+            for k in range(d):
+                coord = np.cumsum(np.where(ejes == k, signos, 0), axis=1)  # posición en el eje k
+                dist2 += coord.astype(float) ** 2
+
+            resultado[hechas:hechas + m] = np.sqrt(dist2.max(axis=1))
+            hechas += m
+            if progreso:
+                progreso(hechas / repeticiones)
+        segundos = time.perf_counter() - t0
+        return resultado, segundos
+
+    def tabla(self, dimensiones, lista_pasos, lista_reps, progreso=None):
+        """
+        Ejecuta todas las combinaciones (dimensión, pasos, repeticiones).
+        Devuelve una lista de diccionarios con el promedio de distancia máxima.
+        """
+        combos = [(d, n, r) for d in dimensiones for n in lista_pasos for r in lista_reps]
+        filas = []
+        for i, (d, n, r) in enumerate(combos):
+            dist, seg = self.distancias_maximas(d, n, r)
+            prom = float(dist.mean())
+            filas.append({
+                "dimension": d,
+                "pasos": n,
+                "repeticiones": r,
+                "promedio_dist_max": prom,
+                "desv_est": float(dist.std(ddof=1)) if r > 1 else 0.0,
+                "prom_entre_raiz_n": prom / math.sqrt(n),
+                "tiempo_s": seg,
+            })
+            if progreso:
+                progreso((i + 1) / len(combos), f"{i + 1}/{len(combos)}  (d={d}, pasos={n}, rep={r})")
+        return filas
+
+
+ 
+#  ARCHIVOS DE SALIDA
+ 
+CARPETA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resultados")
+
+
+def guardar_distancias(dist, d, n, r, segundos):
+    os.makedirs(CARPETA, exist_ok=True)
+    ruta = os.path.join(CARPETA, f"distancias_{d}D_{n}pasos_{r}rep.csv")
+    with open(ruta, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["dimension", d, "pasos", n, "repeticiones", r, "tiempo_s", f"{segundos:.4f}"])
+        w.writerow(["caminata", "distancia_maxima"])
+        for i, x in enumerate(dist, 1):
+            w.writerow([i, f"{x:.6f}"])
+    return ruta
+
+
+def guardar_tabla(filas):
+    os.makedirs(CARPETA, exist_ok=True)
+    ruta = os.path.join(CARPETA, "tabla_resultados.csv")
+    with open(ruta, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["dimension", "pasos", "repeticiones", "promedio_dist_max",
+                    "desv_est", "promedio/sqrt(pasos)", "tiempo_s"])
+        for x in filas:
+            w.writerow([x["dimension"], x["pasos"], x["repeticiones"],
+                        f"{x['promedio_dist_max']:.4f}", f"{x['desv_est']:.4f}",
+                        f"{x['prom_entre_raiz_n']:.4f}", f"{x['tiempo_s']:.4f}"])
+    return ruta
+
+
+ 
+ 
+# ======================================================================
+#  INTERFAZ GRÁFICA
+# ======================================================================
+BG = "#F5F6F8"        # fondo de la ventana
+CARD = "#FFFFFF"      # tarjetas
+TXT = "#1F2937"       # texto principal
+MUTED = "#6B7280"     # texto secundario
+BORDER = "#E5E7EB"    # bordes suaves
+ACCENT = "#2563EB"    # azul de acento
+ACCENT_D = "#1D4ED8"
+GOOD = "#16A34A"      # verde (convergencia)
+WARN = "#D97706"      # ámbar (no concluyente)
+ 
+ 
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title("Caminata Aleatoria")
+        root.geometry("900x800")
+        root.minsize(820, 700)
+        root.configure(bg=BG)
+ 
+        self.sim = CaminataAleatoria()
+        self.cola = queue.Queue()
+        self.fuente = self._elegir_fuente()
+        self._estilos()
+        self._construir()
+        self.root.after(100, self.revisar_cola)
+ 
+    #    estilo   
+    def _elegir_fuente(self):
+        disponibles = set(tkfont.families())
+        for f in ("Segoe UI", "SF Pro Text", "Helvetica Neue", "Inter", "Ubuntu", "DejaVu Sans"):
+            if f in disponibles:
+                return f
+        return "TkDefaultFont"
+ 
+    def _estilos(self):
+        F = self.fuente
+        s = ttk.Style()
+        s.theme_use("clam")
+        s.configure("TFrame", background=BG)
+        s.configure("Clean.TEntry", fieldbackground=CARD, foreground=TXT, bordercolor=BORDER,
+                    lightcolor=BORDER, darkcolor=BORDER, padding=6)
+        s.configure("Clean.TSpinbox", fieldbackground=CARD, foreground=TXT, bordercolor=BORDER,
+                    lightcolor=BORDER, darkcolor=BORDER, arrowcolor=MUTED, padding=6)
+        s.configure("Accent.TButton", background=ACCENT, foreground="white", borderwidth=0,
+                    focusthickness=0, padding=(20, 9), font=(F, 10, "bold"))
+        s.map("Accent.TButton", background=[("active", ACCENT_D), ("disabled", "#93C5FD")])
+        s.configure("Ghost.TButton", background=CARD, foreground=ACCENT, bordercolor=BORDER,
+                    lightcolor=BORDER, darkcolor=BORDER, focusthickness=0, padding=(20, 9),
+                    font=(F, 10, "bold"))
+        s.map("Ghost.TButton", background=[("active", "#EFF6FF")],
+              foreground=[("disabled", "#9CA3AF")])
+        s.configure("Thin.Horizontal.TProgressbar", troughcolor="#E5E7EB", background=ACCENT,
+                    lightcolor=ACCENT, darkcolor=ACCENT, bordercolor="#E5E7EB", thickness=5)
+        s.configure("Treeview", background=CARD, fieldbackground=CARD, foreground=TXT,
+                    rowheight=26, borderwidth=0, font=(F, 10))
+        s.map("Treeview", background=[("selected", "#DBEAFE")], foreground=[("selected", TXT)])
+        s.configure("Treeview.Heading", background="#F3F4F6", foreground=MUTED, relief="flat",
+                    font=(F, 9, "bold"), padding=(0, 6))
+        s.map("Treeview.Heading", background=[("active", "#E5E7EB")])
+ 
+    def _tarjeta(self, padre):
+        return tk.Frame(padre, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+ 
+    def _etiqueta(self, padre, texto, tam=10, negrita=False, color=TXT, fondo=CARD, **kw):
+        estilo = "bold" if negrita else "normal"
+        return tk.Label(padre, text=texto, bg=fondo, fg=color, font=(self.fuente, tam, estilo), **kw)
+ 
+    #    construcción de la ventana   
+    def _construir(self):
+        F = self.fuente
+        px = 24
+ 
+        # Encabezado
+        enc = tk.Frame(self.root, bg=BG)
+        enc.pack(fill="x", padx=px, pady=(20, 10))
+        self._etiqueta(enc, "Caminata Aleatoria", 20, True, fondo=BG).pack(anchor="w")
+        self._etiqueta(enc, "Distancia máxima al origen - pasos unitarios en Rⁿ", 10,
+                       color=MUTED, fondo=BG).pack(anchor="w")
+ 
+        # Parámetros
+        par = self._tarjeta(self.root)
+        par.pack(fill="x", padx=px)
+        fila = tk.Frame(par, bg=CARD)
+        fila.pack(fill="x", padx=16, pady=14)
+ 
+        self.var_dim = tk.StringVar(value="1")
+        self.var_pasos = tk.StringVar(value="1000")
+        self.var_reps = tk.StringVar(value="1000")
+ 
+        def campo(col, titulo, var, spin=False):
+            caja = tk.Frame(fila, bg=CARD)
+            caja.grid(row=0, column=col, padx=(0, 14), sticky="w")
+            self._etiqueta(caja, titulo, 9, color=MUTED).pack(anchor="w", pady=(0, 3))
+            if spin:
+                w = ttk.Spinbox(caja, from_=1, to=10, width=7, textvariable=var,
+                                style="Clean.TSpinbox", font=(F, 11))
+            else:
+                w = ttk.Entry(caja, width=10, textvariable=var, style="Clean.TEntry",
+                              font=(F, 11))
+            w.pack()
+ 
+        campo(0, "Dimensión", self.var_dim, spin=True)
+        campo(1, "Pasos por caminata", self.var_pasos)
+        campo(2, "Repeticiones", self.var_reps)
+ 
+        botones = tk.Frame(fila, bg=CARD)
+        botones.grid(row=0, column=3, sticky="e", padx=(10, 0))
+        fila.columnconfigure(3, weight=1)
+        self.btn_run = ttk.Button(botones, text="Ejecutar", style="Accent.TButton",
+                                  command=self.ejecutar)
+        self.btn_run.pack(side="left", padx=(0, 8))
+        self.btn_tabla = ttk.Button(botones, text="Tabla completa", style="Ghost.TButton",
+                                    command=self.generar_tabla)
+        self.btn_tabla.pack(side="left")
+ 
+        # Progreso
+        self.barra = ttk.Progressbar(self.root, mode="determinate", maximum=1.0,
+                                     style="Thin.Horizontal.TProgressbar")
+        self.barra.pack(fill="x", padx=px, pady=(12, 2))
+        self.var_estado = tk.StringVar(value="Listo")
+        tk.Label(self.root, textvariable=self.var_estado, bg=BG, fg=MUTED,
+                 font=(F, 9)).pack(anchor="w", padx=px)
+ 
+        # Métricas
+        met = tk.Frame(self.root, bg=BG)
+        met.pack(fill="x", padx=px, pady=(8, 0))
+        self.m_prom = self._metrica(met, 0, "Promedio dist. máx.")
+        self.m_desv = self._metrica(met, 1, "Desviación estándar")
+        self.m_ratio = self._metrica(met, 2, "Promedio / √pasos")
+        self.m_tiempo = self._metrica(met, 3, "Tiempo de ejecución")
+        self.var_archivo = tk.StringVar(value="")
+        tk.Label(self.root, textvariable=self.var_archivo, bg=BG, fg=MUTED, font=(F, 8),
+                 anchor="w", justify="left").pack(fill="x", padx=px, pady=(4, 0))
+ 
+        # Tabla
+        tabla = self._tarjeta(self.root)
+        tabla.pack(fill="both", expand=True, padx=px, pady=(10, 0))
+        cols = ("dim", "pasos", "reps", "prom", "desv", "ratio", "tiempo")
+        nombres = ("Dim", "Pasos", "Repeticiones", "Promedio", "Desv. est.", "Prom/√pasos",
+                   "Tiempo (s)")
+        self.tree = ttk.Treeview(tabla, columns=cols, show="headings", height=8)
+        for c, nom in zip(cols, nombres):
+            self.tree.heading(c, text=nom)
+            self.tree.column(c, width=100, anchor="center")
+        self.tree.tag_configure("alt", background="#FAFAFB")
+        sb = ttk.Scrollbar(tabla, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True, padx=(1, 0), pady=1)
+        sb.pack(side="right", fill="y", pady=1)
+ 
+        # Conclusión
+        con = self._tarjeta(self.root)
+        con.pack(fill="x", padx=px, pady=14)
+        self.c_franja = tk.Frame(con, bg=BORDER, width=6)
+        self.c_franja.pack(side="left", fill="y")
+        cuerpo = tk.Frame(con, bg=CARD)
+        cuerpo.pack(side="left", fill="both", expand=True, padx=18, pady=14)
+        self._etiqueta(cuerpo, "CONCLUSIÓN", 8, True, MUTED).pack(anchor="w")
+        self.c_titulo = self._etiqueta(cuerpo, "Aún sin resultados", 15, True)
+        self.c_titulo.pack(anchor="w", pady=(2, 6))
+        self.c_det = self._etiqueta(cuerpo, "Pulsa «Tabla completa» para ver si el promedio de la "
+                                    "distancia máxima converge.", 10, color=MUTED,
+                                    justify="left", anchor="w")
+        self.c_det.pack(fill="x")
+        self.c_nota = self._etiqueta(cuerpo, "", 10, color=MUTED, justify="left", anchor="w")
+        self.c_nota.pack(fill="x", pady=(8, 0))
+        cuerpo.bind("<Configure>", self._ajustar_texto)
+ 
+    def _ajustar_texto(self, evento):
+        ancho = max(240, evento.width - 8)
+        self.c_det.configure(wraplength=ancho)
+        self.c_nota.configure(wraplength=ancho)
+ 
+    def _metrica(self, padre, col, titulo):
+        padre.columnconfigure(col, weight=1, uniform="m")
+        tarjeta = self._tarjeta(padre)
+        tarjeta.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 6, 0))
+        self._etiqueta(tarjeta, titulo, 9, color=MUTED).pack(anchor="w", padx=14, pady=(10, 0))
+        valor = tk.StringVar(value="—")
+        tk.Label(tarjeta, textvariable=valor, bg=CARD, fg=TXT,
+                 font=(self.fuente, 18, "bold")).pack(anchor="w", padx=14, pady=(0, 10))
+        return valor
+ 
+    #    utilidades   
+    def leer_parametros(self):
+        try:
+            d = int(self.var_dim.get())
+            n = int(self.var_pasos.get())
+            r = int(self.var_reps.get())
+        except ValueError:
+            raise ValueError("Dimensión, pasos y repeticiones deben ser números enteros.")
+        if d < 1 or n < 1 or r < 1:
+            raise ValueError("Todos los parámetros deben ser enteros mayores o iguales a 1.")
+        return d, n, r
+ 
+    def bloquear(self, estado):
+        s = "disabled" if estado else "normal"
+        self.btn_run.configure(state=s)
+        self.btn_tabla.configure(state=s)
+ 
+    #    experimento individual   
+    def ejecutar(self):
+        try:
+            d, n, r = self.leer_parametros()
+        except ValueError as e:
+            messagebox.showerror("Parámetros inválidos", str(e))
+            return
+        self.bloquear(True)
+        self.barra["value"] = 0
+        self.var_estado.set("Ejecutando…")
+ 
+        def tarea():
+            dist, seg = self.sim.distancias_maximas(
+                d, n, r, progreso=lambda p: self.cola.put(("prog", p, "")))
+            ruta = guardar_distancias(dist, d, n, r, seg)
+            self.cola.put(("fin_exp", (d, n, r, dist, seg, ruta)))
+ 
+        threading.Thread(target=tarea, daemon=True).start()
+ 
+    #    tabla completa   
+    def generar_tabla(self):
+        if not messagebox.askyesno(
+                "Tabla completa",
+                "Se ejecutarán 18 combinaciones (1D y 2D, 100/1000/10000 pasos y "
+                "100/1000/10000 repeticiones).\nPuede tardar unos segundos o varios minutos. "
+                "¿Continuar?"):
+            return
+        self.bloquear(True)
+        self.barra["value"] = 0
+        self.var_estado.set("Generando tabla…")
+        for v in (self.m_prom, self.m_desv, self.m_ratio, self.m_tiempo):
+            v.set("—")
+        for fila in self.tree.get_children():
+            self.tree.delete(fila)
+ 
+        def tarea():
+            filas = self.sim.tabla(
+                [1, 2], [100, 1000, 10000], [100, 1000, 10000],
+                progreso=lambda p, msg: self.cola.put(("prog", p, msg)))
+            ruta = guardar_tabla(filas)
+            self.cola.put(("fin_tabla", (filas, ruta)))
+ 
+        threading.Thread(target=tarea, daemon=True).start()
+ 
+    #    comunicación hilo -> interfaz   
+    def revisar_cola(self):
+        try:
+            while True:
+                msg = self.cola.get_nowait()
+                if msg[0] == "prog":
+                    self.barra["value"] = msg[1]
+                    if msg[2]:
+                        self.var_estado.set(msg[2])
+                elif msg[0] == "fin_exp":
+                    self.mostrar_experimento(*msg[1])
+                elif msg[0] == "fin_tabla":
+                    self.mostrar_tabla(*msg[1])
+        except queue.Empty:
+            pass
+        self.root.after(100, self.revisar_cola)
+ 
+    def mostrar_experimento(self, d, n, r, dist, seg, ruta):
+        prom = dist.mean()
+        desv = dist.std(ddof=1) if r > 1 else 0.0
+        self.m_prom.set(f"{prom:.3f}")
+        self.m_desv.set(f"{desv:.3f}")
+        self.m_ratio.set(f"{prom / math.sqrt(n):.3f}")
+        self.m_tiempo.set(f"{seg:.3f} s")
+        self.var_archivo.set(
+            f"{d}D · {n} pasos · {r} repeticiones · mín {dist.min():.2f} · máx {dist.max():.2f}"
+            f"\nDistancias guardadas en: {ruta}")
+        self.var_estado.set("Listo")
+        self.barra["value"] = 1
+        self.bloquear(False)
+ 
+    def mostrar_tabla(self, filas, ruta):
+        for i, x in enumerate(filas):
+            self.tree.insert("", "end", tags=("alt",) if i % 2 else (), values=(
+                x["dimension"], x["pasos"], x["repeticiones"],
+                f"{x['promedio_dist_max']:.4f}", f"{x['desv_est']:.4f}",
+                f"{x['prom_entre_raiz_n']:.4f}", f"{x['tiempo_s']:.3f}"))
+        self._conclusion(filas)
+        self.var_archivo.set(f"Tabla guardada en: {ruta}")
+        self.var_estado.set("Tabla completa")
+        self.barra["value"] = 1
+        self.bloquear(False)
+ 
+    def _conclusion(self, filas):
+        """Convergencia = el cociente Promedio/√pasos se mantiene casi constante."""
+        lineas, estables, medias = [], [], {}
+        for d in (1, 2):
+            rs = [x["prom_entre_raiz_n"] for x in filas
+                  if x["dimension"] == d and x["pasos"] >= 1000 and x["repeticiones"] >= 1000]
+            if not rs:
+                continue
+            media = sum(rs) / len(rs)
+            variacion = (max(rs) - min(rs)) / media
+            medias[d] = media
+            estables.append(variacion < 0.05)
+            teorico = f"  ·  valor teórico {math.sqrt(math.pi / 2):.4f}" if d == 1 else ""
+            lineas.append(f"{d}D:  Promedio/√pasos ≈ {media:.3f}  (varía {variacion * 100:.1f} %)"
+                          f"{teorico}")
+        if not estables:
+            return
+        if all(estables):
+            self.c_franja.configure(bg=GOOD)
+            self.c_titulo.configure(text="Sí hay convergencia", fg=GOOD)
+        else:
+            self.c_franja.configure(bg=WARN)
+            self.c_titulo.configure(text="Convergencia no concluyente", fg=WARN)
+        self.c_det.configure(text="\n".join(lineas), fg=TXT)
+        nota = ("La distancia máxima promedio crece proporcional a √pasos: al aumentar pasos y "
+                "repeticiones el cociente se mantiene casi constante, y más repeticiones solo "
+                "reducen el ruido de la estimación.")
+        if 1 in medias and 2 in medias and medias[2] < medias[1]:
+            nota += " En 2D el valor es menor porque cada paso solo avanza en uno de los dos ejes."
+        self.c_nota.configure(text=nota)
+ 
+ 
+def main():
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
+ 
+ 
+if __name__ == "__main__":
+    main()
